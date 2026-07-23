@@ -22,6 +22,9 @@ const sql = neon(process.env.DATABASE_URL);
 
 // Helper function to send verification email using Mailgun
 const sendVerificationEmail = async (email, firstName, token) => {
+
+  const deepLink = `studymate://verify-email?token=${token}`;
+  
   const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${token}`;
   
   const htmlContent = `
