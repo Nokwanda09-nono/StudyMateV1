@@ -6,11 +6,13 @@ CREATE TABLE IF NOT EXISTS users (
     email VARCHAR(255) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     email_verified BOOLEAN DEFAULT FALSE,
-    verification_token UUID DEFAULT gen_random_uuid(),
-    verification_token_expires TIMESTAMP,
+    verification_code VARCHAR(6),
+    verification_code_expires TIMESTAMP,
+    verification_attempts INTEGER DEFAULT 0;
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
 
 -- Create index for faster lookups
 CREATE INDEX idx_users_email ON users(email);
