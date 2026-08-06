@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors({
-  origin: '*',
+  origin: 'http://localhost:8081',
   credentials: true
 }));
 app.use(express.json());
@@ -390,6 +390,226 @@ app.post('/api/login', async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Server error during login' });
+  }
+});
+
+// Save onboarding profile
+app.post('/onboarding', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const {
+      qualification,
+      year,
+      academicGoal,
+      learningStyle,
+      studyChallenges,
+      studyHours,
+      productiveTime,
+      reminderFrequency,
+      aiSupport,
+      resourceRecommendations
+    } = req.body;
+
+    // Validate required fields
+    if (!qualification || !year || !academicGoal || !learningStyle || 
+        !studyChallenges || studyChallenges.length < 2 || !studyHours || 
+        !productiveTime || !reminderFrequency || !aiSupport || 
+        !resourceRecommendations) {
+      return res.status(400).json({
+        error: 'All fields are required. Please complete all steps.'
+      });
+    }
+
+    // Check if user already has a profile
+    const existingProfile = await db.query(
+      'SELECT id FROM user_profiles WHERE user_id = $1',
+      [userId]
+    );
+
+    let result;
+    if (existingProfile.rows.length > 0) {
+      // Update existing profile
+      result = await db.query(
+        `UPDATE user_profiles 
+         SET 
+           qualification = $1,
+           year = $2,
+           academic_goal = $3,
+           learning_style = $4,
+           study_challenges = $5,
+           study_hours = $6,
+           productive_time = $7,
+           reminder_frequency = $8,
+           ai_support = $9,
+           resource_recommendations = $10,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $11
+         RETURNING *`,
+        [
+          qualification,
+          year,
+          academicGoal,
+          learningStyle,
+          JSON.stringify(studyChallenges),
+          studyHours,
+          productiveTime,
+          reminderFrequency,
+          aiSupport,
+          resourceRecommendations,
+          userId
+        ]
+      );
+    } else {
+      // Create new profile
+      result = await db.query(
+        `INSERT INTO user_profiles (
+          user_id,
+          qualification,
+          year,
+          academic_goal,
+          learning_style,
+          study_challenges,
+          study_hours,
+          productive_time,
+          reminder_frequency,
+          ai_support,
+          resource_recommendations,
+          created_at,
+          updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        RETURNING *`,
+        [
+          userId,
+          qualification,
+          year,
+          academicGoal,
+          learningStyle,
+          JSON.stringify(studyChallenges),
+          studyHours,
+          productiveTime,
+          reminderFrequency,
+          aiSupport,
+          resourceRecommendations
+        ]
+      );
+    }
+
+    // Update user's onboarding status
+    await db.query(
+      'UPDATE users SET onboarding_completed = true WHERE id = $1',
+      [userId]
+    );
+
+    // Return the profile data
+    res.status(200).json({
+      success: true,
+      profile: result.rows[0],
+      message: 'Onboarding completed successfully'
+    });
+
+  } catch (error) {
+    console.error('Error saving onboarding profile:', error);
+    res.status(500).json({
+      error: 'Failed to save onboarding profile. Please try again.'
+    });
+  }
+});
+
+// Get onboarding profile
+app.get('/onboarding', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await db.query(
+      'SELECT * FROM user_profiles WHERE user_id = $1',
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Profile not found'
+      });
+    }
+
+    const profile = result.rows[0];
+    // Parse JSON fields if needed
+    if (profile.study_challenges) {
+      profile.study_challenges = JSON.parse(profile.study_challenges);
+    }
+
+    res.status(200).json({
+      success: true,
+      profile
+    });
+
+  } catch (error) {
+    console.error('Error fetching onboarding profile:', error);
+    res.status(500).json({
+      error: 'Failed to fetch onboarding profile'
+    });
+  }
+});
+
+// Update onboarding profile
+app.put('/onboarding', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const updates = req.body;
+
+    // Build dynamic update query
+    const allowedFields = [
+      'qualification', 'year', 'academic_goal', 'learning_style',
+      'study_challenges', 'study_hours', 'productive_time',
+      'reminder_frequency', 'ai_support', 'resource_recommendations'
+    ];
+
+    const updateFields = [];
+    const values = [];
+    let paramCounter = 1;
+
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined) {
+        // Convert camelCase to snake_case for database
+        const dbField = field.replace(/([A-Z])/g, '_$1').toLowerCase();
+        updateFields.push(`${dbField} = $${paramCounter}`);
+        values.push(field === 'study_challenges' ? JSON.stringify(updates[field]) : updates[field]);
+        paramCounter++;
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        error: 'No fields to update'
+      });
+    }
+
+    values.push(userId);
+    const query = `
+      UPDATE user_profiles 
+      SET ${updateFields.join(', ')}, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = $${paramCounter}
+      RETURNING *
+    `;
+
+    const result = await db.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Profile not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      profile: result.rows[0],
+      message: 'Profile updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error updating onboarding profile:', error);
+    res.status(500).json({
+      error: 'Failed to update onboarding profile'
+    });
   }
 });
 
