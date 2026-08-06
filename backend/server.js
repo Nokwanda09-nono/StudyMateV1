@@ -8,6 +8,7 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key';
 
 // Middleware
 app.use(cors({
@@ -18,6 +19,203 @@ app.use(express.json());
 
 // Neon Database Connection
 const sql = neon(process.env.DATABASE_URL);
+
+// ==================== DATABASE INITIALIZATION ====================
+
+/**
+ * Create tables if they don't exist
+ * This runs automatically when the server starts
+ */
+const initializeDatabase = async () => {
+  try {
+    console.log('🔧 Initializing database tables...');
+
+    // Create users table
+    await sql`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
+        email_verified BOOLEAN DEFAULT FALSE,
+        onboarding_completed BOOLEAN DEFAULT FALSE,
+        verification_code VARCHAR(6),
+        verification_code_expires TIMESTAMP,
+        verification_attempts INTEGER DEFAULT 0,
+        role VARCHAR(50) DEFAULT 'user',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+    console.log('✅ Users table ready');
+
+    // Create user_profiles table
+    await sql`
+      CREATE TABLE IF NOT EXISTS user_profiles (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        qualification VARCHAR(50) NOT NULL,
+        year VARCHAR(50) NOT NULL,
+        academic_goal VARCHAR(50) NOT NULL,
+        learning_style VARCHAR(50) NOT NULL,
+        study_challenges JSONB NOT NULL,
+        study_hours VARCHAR(50) NOT NULL,
+        productive_time VARCHAR(50) NOT NULL,
+        reminder_frequency VARCHAR(50) NOT NULL,
+        ai_support VARCHAR(50) NOT NULL,
+        resource_recommendations VARCHAR(10) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id)
+      )
+    `;
+    console.log('✅ User profiles table ready');
+
+    // Create indexes for better performance
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)
+    `;
+    console.log('✅ Users email index ready');
+
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_users_onboarding ON users(onboarding_completed)
+    `;
+    console.log('✅ Users onboarding index ready');
+
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id)
+    `;
+    console.log('✅ User profiles index ready');
+
+    // Create function to update updated_at timestamp
+    await sql`
+      CREATE OR REPLACE FUNCTION update_updated_at_column()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+      END;
+      $$ language 'plpgsql'
+    `;
+    console.log('✅ Update timestamp function ready');
+
+    // Create triggers for updated_at
+    await sql`
+      DROP TRIGGER IF EXISTS update_users_updated_at ON users
+    `;
+    await sql`
+      CREATE TRIGGER update_users_updated_at 
+        BEFORE UPDATE ON users 
+        FOR EACH ROW 
+        EXECUTE FUNCTION update_updated_at_column()
+    `;
+    console.log('✅ Users trigger ready');
+
+    await sql`
+      DROP TRIGGER IF EXISTS update_user_profiles_updated_at ON user_profiles
+    `;
+    await sql`
+      CREATE TRIGGER update_user_profiles_updated_at 
+        BEFORE UPDATE ON user_profiles 
+        FOR EACH ROW 
+        EXECUTE FUNCTION update_updated_at_column()
+    `;
+    console.log('✅ User profiles trigger ready');
+
+    console.log('🎉 Database initialization complete!');
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    // Don't exit the process, just log the error
+    // The server will still start but some features might not work
+  }
+};
+
+// ==================== AUTHENTICATION MIDDLEWARE ====================
+
+/**
+ * Authentication Middleware
+ * Verifies JWT token and attaches user to request
+ */
+const auth = async (req, res, next) => {
+  try {
+    // Get token from Authorization header
+    const authHeader = req.header('Authorization');
+    
+    if (!authHeader) {
+      return res.status(401).json({ 
+        error: 'No authentication token provided' 
+      });
+    }
+
+    // Check if it's a Bearer token
+    const parts = authHeader.split(' ');
+    if (parts.length !== 2 || parts[0] !== 'Bearer') {
+      return res.status(401).json({ 
+        error: 'Invalid authorization format. Use Bearer token.' 
+      });
+    }
+
+    const token = parts[1];
+
+    // Verify token
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (jwtError) {
+      if (jwtError.name === 'TokenExpiredError') {
+        return res.status(401).json({ 
+          error: 'Token has expired. Please login again.' 
+        });
+      }
+      if (jwtError.name === 'JsonWebTokenError') {
+        return res.status(401).json({ 
+          error: 'Invalid token. Please login again.' 
+        });
+      }
+      throw jwtError;
+    }
+
+    // Get user from database using Neon SQL
+    const userResult = await sql`
+      SELECT id, email, first_name, last_name, email_verified, onboarding_completed 
+      FROM users 
+      WHERE id = ${decoded.userId}
+    `;
+
+    if (userResult.length === 0) {
+      return res.status(401).json({ 
+        error: 'User not found. Please login again.' 
+      });
+    }
+
+    const user = userResult[0];
+    
+    // Check if email is verified
+    if (!user.email_verified) {
+      return res.status(403).json({ 
+        error: 'Please verify your email before accessing this resource' 
+      });
+    }
+
+    // Attach user to request
+    req.user = {
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      emailVerified: user.email_verified,
+      onboardingCompleted: user.onboarding_completed
+    };
+
+    next();
+  } catch (error) {
+    console.error('Auth middleware error:', error);
+    res.status(500).json({ 
+      error: 'Authentication failed. Please try again.' 
+    });
+  }
+};
 
 // Helper function to generate a 6-digit verification code
 const generateVerificationCode = () => {
@@ -172,7 +370,6 @@ app.post('/api/register', async (req, res) => {
       message: 'Registration successful! Please check your email for the verification code.',
       user: newUser,
       emailSent: true,
-      // Don't send the code back in response for security
     });
 
   } catch (error) {
@@ -371,7 +568,7 @@ app.post('/api/login', async (req, res) => {
         firstName: user[0].first_name,
         lastName: user[0].last_name
       },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -383,7 +580,8 @@ app.post('/api/login', async (req, res) => {
         firstName: user[0].first_name,
         lastName: user[0].last_name,
         email: user[0].email,
-        emailVerified: user[0].email_verified
+        emailVerified: user[0].email_verified,
+        onboardingCompleted: user[0].onboarding_completed || false
       }
     });
 
@@ -393,8 +591,10 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Save onboarding profile
-app.post('/onboarding', auth, async (req, res) => {
+// ==================== ONBOARDING ROUTES ====================
+
+// 5. Save onboarding profile
+app.post('/api/onboarding', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     const {
@@ -420,49 +620,35 @@ app.post('/onboarding', auth, async (req, res) => {
       });
     }
 
-    // Check if user already has a profile
-    const existingProfile = await db.query(
-      'SELECT id FROM user_profiles WHERE user_id = $1',
-      [userId]
-    );
+    // Check if user already has a profile using Neon SQL
+    const existingProfile = await sql`
+      SELECT id FROM user_profiles WHERE user_id = ${userId}
+    `;
 
     let result;
-    if (existingProfile.rows.length > 0) {
+    if (existingProfile.length > 0) {
       // Update existing profile
-      result = await db.query(
-        `UPDATE user_profiles 
-         SET 
-           qualification = $1,
-           year = $2,
-           academic_goal = $3,
-           learning_style = $4,
-           study_challenges = $5,
-           study_hours = $6,
-           productive_time = $7,
-           reminder_frequency = $8,
-           ai_support = $9,
-           resource_recommendations = $10,
-           updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = $11
-         RETURNING *`,
-        [
-          qualification,
-          year,
-          academicGoal,
-          learningStyle,
-          JSON.stringify(studyChallenges),
-          studyHours,
-          productiveTime,
-          reminderFrequency,
-          aiSupport,
-          resourceRecommendations,
-          userId
-        ]
-      );
+      result = await sql`
+        UPDATE user_profiles 
+        SET 
+          qualification = ${qualification},
+          year = ${year},
+          academic_goal = ${academicGoal},
+          learning_style = ${learningStyle},
+          study_challenges = ${JSON.stringify(studyChallenges)},
+          study_hours = ${studyHours},
+          productive_time = ${productiveTime},
+          reminder_frequency = ${reminderFrequency},
+          ai_support = ${aiSupport},
+          resource_recommendations = ${resourceRecommendations},
+          updated_at = NOW()
+        WHERE user_id = ${userId}
+        RETURNING *
+      `;
     } else {
       // Create new profile
-      result = await db.query(
-        `INSERT INTO user_profiles (
+      result = await sql`
+        INSERT INTO user_profiles (
           user_id,
           qualification,
           year,
@@ -476,34 +662,47 @@ app.post('/onboarding', auth, async (req, res) => {
           resource_recommendations,
           created_at,
           updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        RETURNING *`,
-        [
-          userId,
-          qualification,
-          year,
-          academicGoal,
-          learningStyle,
-          JSON.stringify(studyChallenges),
-          studyHours,
-          productiveTime,
-          reminderFrequency,
-          aiSupport,
-          resourceRecommendations
-        ]
-      );
+        ) VALUES (
+          ${userId},
+          ${qualification},
+          ${year},
+          ${academicGoal},
+          ${learningStyle},
+          ${JSON.stringify(studyChallenges)},
+          ${studyHours},
+          ${productiveTime},
+          ${reminderFrequency},
+          ${aiSupport},
+          ${resourceRecommendations},
+          NOW(),
+          NOW()
+        )
+        RETURNING *
+      `;
     }
 
     // Update user's onboarding status
-    await db.query(
-      'UPDATE users SET onboarding_completed = true WHERE id = $1',
-      [userId]
-    );
+    await sql`
+      UPDATE users SET onboarding_completed = TRUE WHERE id = ${userId}
+    `;
 
-    // Return the profile data
+    // Get updated user data
+    const userResult = await sql`
+      SELECT id, email, first_name, last_name, onboarding_completed 
+      FROM users 
+      WHERE id = ${userId}
+    `;
+
+    // Parse study_challenges back to array for response
+    const profileData = result[0];
+    if (profileData.study_challenges) {
+      profileData.study_challenges = JSON.parse(profileData.study_challenges);
+    }
+
     res.status(200).json({
       success: true,
-      profile: result.rows[0],
+      profile: profileData,
+      user: userResult[0],
       message: 'Onboarding completed successfully'
     });
 
@@ -515,24 +714,23 @@ app.post('/onboarding', auth, async (req, res) => {
   }
 });
 
-// Get onboarding profile
-app.get('/onboarding', auth, async (req, res) => {
+// 6. Get onboarding profile
+app.get('/api/onboarding', auth, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const result = await db.query(
-      'SELECT * FROM user_profiles WHERE user_id = $1',
-      [userId]
-    );
+    const result = await sql`
+      SELECT * FROM user_profiles WHERE user_id = ${userId}
+    `;
 
-    if (result.rows.length === 0) {
+    if (result.length === 0) {
       return res.status(404).json({
         error: 'Profile not found'
       });
     }
 
-    const profile = result.rows[0];
-    // Parse JSON fields if needed
+    const profile = result[0];
+    // Parse JSON fields
     if (profile.study_challenges) {
       profile.study_challenges = JSON.parse(profile.study_challenges);
     }
@@ -550,58 +748,111 @@ app.get('/onboarding', auth, async (req, res) => {
   }
 });
 
-// Update onboarding profile
-app.put('/onboarding', auth, async (req, res) => {
+// 7. Update onboarding profile
+app.put('/api/onboarding', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    const updates = req.body;
+    const {
+      qualification,
+      year,
+      academicGoal,
+      learningStyle,
+      studyChallenges,
+      studyHours,
+      productiveTime,
+      reminderFrequency,
+      aiSupport,
+      resourceRecommendations
+    } = req.body;
 
-    // Build dynamic update query
-    const allowedFields = [
-      'qualification', 'year', 'academic_goal', 'learning_style',
-      'study_challenges', 'study_hours', 'productive_time',
-      'reminder_frequency', 'ai_support', 'resource_recommendations'
-    ];
-
-    const updateFields = [];
+    // Build update query dynamically
+    const updates = [];
     const values = [];
-    let paramCounter = 1;
+    let paramCount = 1;
 
-    for (const field of allowedFields) {
-      if (updates[field] !== undefined) {
-        // Convert camelCase to snake_case for database
-        const dbField = field.replace(/([A-Z])/g, '_$1').toLowerCase();
-        updateFields.push(`${dbField} = $${paramCounter}`);
-        values.push(field === 'study_challenges' ? JSON.stringify(updates[field]) : updates[field]);
-        paramCounter++;
-      }
+    if (qualification !== undefined) {
+      updates.push(`qualification = $${paramCount}`);
+      values.push(qualification);
+      paramCount++;
+    }
+    if (year !== undefined) {
+      updates.push(`year = $${paramCount}`);
+      values.push(year);
+      paramCount++;
+    }
+    if (academicGoal !== undefined) {
+      updates.push(`academic_goal = $${paramCount}`);
+      values.push(academicGoal);
+      paramCount++;
+    }
+    if (learningStyle !== undefined) {
+      updates.push(`learning_style = $${paramCount}`);
+      values.push(learningStyle);
+      paramCount++;
+    }
+    if (studyChallenges !== undefined) {
+      updates.push(`study_challenges = $${paramCount}`);
+      values.push(JSON.stringify(studyChallenges));
+      paramCount++;
+    }
+    if (studyHours !== undefined) {
+      updates.push(`study_hours = $${paramCount}`);
+      values.push(studyHours);
+      paramCount++;
+    }
+    if (productiveTime !== undefined) {
+      updates.push(`productive_time = $${paramCount}`);
+      values.push(productiveTime);
+      paramCount++;
+    }
+    if (reminderFrequency !== undefined) {
+      updates.push(`reminder_frequency = $${paramCount}`);
+      values.push(reminderFrequency);
+      paramCount++;
+    }
+    if (aiSupport !== undefined) {
+      updates.push(`ai_support = $${paramCount}`);
+      values.push(aiSupport);
+      paramCount++;
+    }
+    if (resourceRecommendations !== undefined) {
+      updates.push(`resource_recommendations = $${paramCount}`);
+      values.push(resourceRecommendations);
+      paramCount++;
     }
 
-    if (updateFields.length === 0) {
+    if (updates.length === 0) {
       return res.status(400).json({
         error: 'No fields to update'
       });
     }
 
+    updates.push(`updated_at = NOW()`);
     values.push(userId);
+
     const query = `
       UPDATE user_profiles 
-      SET ${updateFields.join(', ')}, updated_at = CURRENT_TIMESTAMP
-      WHERE user_id = $${paramCounter}
+      SET ${updates.join(', ')}
+      WHERE user_id = $${paramCount}
       RETURNING *
     `;
 
-    const result = await db.query(query, values);
+    const result = await sql.query(query, values);
 
-    if (result.rows.length === 0) {
+    if (result.length === 0) {
       return res.status(404).json({
         error: 'Profile not found'
       });
     }
 
+    const profile = result[0];
+    if (profile.study_challenges) {
+      profile.study_challenges = JSON.parse(profile.study_challenges);
+    }
+
     res.status(200).json({
       success: true,
-      profile: result.rows[0],
+      profile,
       message: 'Profile updated successfully'
     });
 
@@ -613,7 +864,7 @@ app.put('/onboarding', auth, async (req, res) => {
   }
 });
 
-// 5. Health check
+// 8. Health check
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
@@ -623,10 +874,72 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📧 Using Mailgun for email delivery`);
-  console.log(`🔐 Using code-based verification`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+// 9. Test auth endpoint (protected route)
+app.get('/api/protected', auth, (req, res) => {
+  res.json({
+    message: 'This is a protected route',
+    user: req.user
+  });
 });
+
+// 10. Database status endpoint
+app.get('/api/db-status', async (req, res) => {
+  try {
+    // Check if tables exist
+    const tables = await sql`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_name IN ('users', 'user_profiles')
+    `;
+
+    const userCount = await sql`SELECT COUNT(*) FROM users`;
+    const profileCount = await sql`SELECT COUNT(*) FROM user_profiles`;
+
+    res.json({
+      status: 'Connected',
+      tables: tables.map(t => t.table_name),
+      userCount: parseInt(userCount[0].count),
+      profileCount: parseInt(profileCount[0].count),
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Database status error:', error);
+    res.status(500).json({
+      error: 'Failed to get database status'
+    });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err);
+  res.status(500).json({
+    error: 'Something went wrong on the server'
+  });
+});
+
+// ==================== START SERVER ====================
+
+// Initialize database and start server
+const startServer = async () => {
+  try {
+    // Initialize database tables
+    await initializeDatabase();
+    
+    // Start the server
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`\n🚀 Server running on port ${PORT}`);
+      console.log(`📧 Using Mailgun for email delivery`);
+      console.log(`🔐 Using code-based verification`);
+      console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+      console.log(`💾 Database status: http://localhost:${PORT}/api/db-status`);
+      console.log(`🔒 Protected route: http://localhost:${PORT}/api/protected (requires auth)\n`);
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+startServer();
