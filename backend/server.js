@@ -250,7 +250,6 @@ app.post('/api/verify-code', async (req, res) => {
     }
 
     if (user[0].email_verified) {
-      // If already verified, generate token and log in directly
       const token = jwt.sign(
         { 
           userId: user[0].id, 
@@ -306,7 +305,6 @@ app.post('/api/verify-code', async (req, res) => {
       });
     }
 
-    // Update user as verified and mark onboarding completed so user goes straight to HomeScreen
     // Update user as verified
     await sql`
       UPDATE users 
@@ -442,7 +440,6 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    // Fetch user profile if available
     const profile = await sql`
       SELECT * FROM onboarding_profiles WHERE user_id = ${user[0].id}
     `;
