@@ -48,6 +48,22 @@ const initializeDatabase = async () => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `;
+
+    // Add missing columns for existing deployments created from older schemas
+    await sql`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS first_name VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS last_name VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS verification_code VARCHAR(6),
+      ADD COLUMN IF NOT EXISTS verification_code_expires TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS verification_attempts INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'user',
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    `;
     console.log('✅ Users table ready');
 
     // Create user_profiles table
@@ -141,18 +157,18 @@ const auth = async (req, res, next) => {
   try {
     // Get token from Authorization header
     const authHeader = req.header('Authorization');
-    
+
     if (!authHeader) {
-      return res.status(401).json({ 
-        error: 'No authentication token provided' 
+      return res.status(401).json({
+        error: 'No authentication token provided'
       });
     }
 
     // Check if it's a Bearer token
     const parts = authHeader.split(' ');
     if (parts.length !== 2 || parts[0] !== 'Bearer') {
-      return res.status(401).json({ 
-        error: 'Invalid authorization format. Use Bearer token.' 
+      return res.status(401).json({
+        error: 'Invalid authorization format. Use Bearer token.'
       });
     }
 
@@ -164,13 +180,13 @@ const auth = async (req, res, next) => {
       decoded = jwt.verify(token, JWT_SECRET);
     } catch (jwtError) {
       if (jwtError.name === 'TokenExpiredError') {
-        return res.status(401).json({ 
-          error: 'Token has expired. Please login again.' 
+        return res.status(401).json({
+          error: 'Token has expired. Please login again.'
         });
       }
       if (jwtError.name === 'JsonWebTokenError') {
-        return res.status(401).json({ 
-          error: 'Invalid token. Please login again.' 
+        return res.status(401).json({
+          error: 'Invalid token. Please login again.'
         });
       }
       throw jwtError;
@@ -184,17 +200,17 @@ const auth = async (req, res, next) => {
     `;
 
     if (userResult.length === 0) {
-      return res.status(401).json({ 
-        error: 'User not found. Please login again.' 
+      return res.status(401).json({
+        error: 'User not found. Please login again.'
       });
     }
 
     const user = userResult[0];
-    
+
     // Check if email is verified
     if (!user.email_verified) {
-      return res.status(403).json({ 
-        error: 'Please verify your email before accessing this resource' 
+      return res.status(403).json({
+        error: 'Please verify your email before accessing this resource'
       });
     }
 
@@ -211,8 +227,8 @@ const auth = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('Auth middleware error:', error);
-    res.status(500).json({ 
-      error: 'Authentication failed. Please try again.' 
+    res.status(500).json({
+      error: 'Authentication failed. Please try again.'
     });
   }
 };
@@ -298,14 +314,14 @@ app.post('/api/register', async (req, res) => {
 
     // Validation
     if (!firstName || !lastName || !email || !password) {
-      return res.status(400).json({ 
-        error: 'All fields are required' 
+      return res.status(400).json({
+        error: 'All fields are required'
       });
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ 
-        error: 'Password must be at least 6 characters' 
+      return res.status(400).json({
+        error: 'Password must be at least 6 characters'
       });
     }
 
@@ -315,8 +331,8 @@ app.post('/api/register', async (req, res) => {
     `;
 
     if (existingUser.length > 0) {
-      return res.status(400).json({ 
-        error: 'User with this email already exists' 
+      return res.status(400).json({
+        error: 'User with this email already exists'
       });
     }
 
@@ -374,8 +390,8 @@ app.post('/api/register', async (req, res) => {
 
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ 
-      error: 'Server error during registration' 
+    res.status(500).json({
+      error: 'Server error during registration'
     });
   }
 });
@@ -386,8 +402,8 @@ app.post('/api/verify-code', async (req, res) => {
     const { email, code } = req.body;
 
     if (!email || !code) {
-      return res.status(400).json({ 
-        error: 'Email and verification code are required' 
+      return res.status(400).json({
+        error: 'Email and verification code are required'
       });
     }
 
@@ -397,15 +413,15 @@ app.post('/api/verify-code', async (req, res) => {
     `;
 
     if (user.length === 0) {
-      return res.status(404).json({ 
-        error: 'User not found' 
+      return res.status(404).json({
+        error: 'User not found'
       });
     }
 
     // Check if already verified
     if (user[0].email_verified) {
-      return res.status(400).json({ 
-        error: 'Email already verified' 
+      return res.status(400).json({
+        error: 'Email already verified'
       });
     }
 
@@ -419,16 +435,16 @@ app.post('/api/verify-code', async (req, res) => {
       `;
 
       const attempts = user[0].verification_attempts + 1;
-      
+
       // Lock account after 5 failed attempts
       if (attempts >= 5) {
-        return res.status(403).json({ 
+        return res.status(403).json({
           error: 'Too many failed attempts. Please request a new verification code.',
           locked: true
         });
       }
 
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Invalid verification code',
         attemptsRemaining: 5 - attempts
       });
@@ -436,7 +452,7 @@ app.post('/api/verify-code', async (req, res) => {
 
     // Check if code is expired
     if (new Date(user[0].verification_code_expires) < new Date()) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Verification code has expired. Please request a new one.',
         expired: true
       });
@@ -461,8 +477,8 @@ app.post('/api/verify-code', async (req, res) => {
 
   } catch (error) {
     console.error('Code verification error:', error);
-    res.status(500).json({ 
-      error: 'Server error during verification' 
+    res.status(500).json({
+      error: 'Server error during verification'
     });
   }
 });
@@ -522,8 +538,8 @@ app.post('/api/resend-verification', async (req, res) => {
 
   } catch (error) {
     console.error('Resend verification error:', error);
-    res.status(500).json({ 
-      error: 'Server error while resending verification' 
+    res.status(500).json({
+      error: 'Server error while resending verification'
     });
   }
 });
@@ -539,34 +555,43 @@ app.post('/api/login', async (req, res) => {
 
     // Find user
     const user = await sql`
-      SELECT * FROM users WHERE email = ${email.toLowerCase()}
+      SELECT id, email, password_hash, first_name, last_name, email_verified, onboarding_completed
+      FROM users
+      WHERE email = ${String(email).toLowerCase().trim()}
     `;
 
     if (user.length === 0) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    const userRecord = user[0];
+    if (!userRecord.password_hash) {
+      return res.status(500).json({
+        error: 'Account data is incomplete. Please contact support or re-register.'
+      });
+    }
+
     // Check if email is verified
-    if (!user[0].email_verified) {
-      return res.status(403).json({ 
+    if (!userRecord.email_verified) {
+      return res.status(403).json({
         error: 'Please verify your email before logging in',
-        requiresVerification: true 
+        requiresVerification: true
       });
     }
 
     // Verify password
-    const validPassword = await bcrypt.compare(password, user[0].password_hash);
+    const validPassword = await bcrypt.compare(password, userRecord.password_hash);
     if (!validPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     // Generate JWT token
     const token = jwt.sign(
-      { 
-        userId: user[0].id, 
-        email: user[0].email,
-        firstName: user[0].first_name,
-        lastName: user[0].last_name
+      {
+        userId: userRecord.id,
+        email: userRecord.email,
+        firstName: userRecord.first_name,
+        lastName: userRecord.last_name
       },
       JWT_SECRET,
       { expiresIn: '7d' }
@@ -576,18 +601,26 @@ app.post('/api/login', async (req, res) => {
       message: 'Login successful',
       token,
       user: {
-        id: user[0].id,
-        firstName: user[0].first_name,
-        lastName: user[0].last_name,
-        email: user[0].email,
-        emailVerified: user[0].email_verified,
-        onboardingCompleted: user[0].onboarding_completed || false
+        id: userRecord.id,
+        firstName: userRecord.first_name,
+        lastName: userRecord.last_name,
+        email: userRecord.email,
+        emailVerified: userRecord.email_verified,
+        onboardingCompleted: userRecord.onboarding_completed || false
       }
     });
 
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Server error during login' });
+    console.error('❌ Login error:', {
+      message: error?.message || String(error),
+      stack: error?.stack,
+      code: error?.code,
+      detail: error?.detail
+    });
+    res.status(500).json({
+      error: 'Server error during login',
+      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+    });
   }
 });
 
@@ -611,10 +644,10 @@ app.post('/api/onboarding', auth, async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!qualification || !year || !academicGoal || !learningStyle || 
-        !studyChallenges || studyChallenges.length < 2 || !studyHours || 
-        !productiveTime || !reminderFrequency || !aiSupport || 
-        !resourceRecommendations) {
+    if (!qualification || !year || !academicGoal || !learningStyle ||
+      !studyChallenges || studyChallenges.length < 2 || !studyHours ||
+      !productiveTime || !reminderFrequency || !aiSupport ||
+      !resourceRecommendations) {
       return res.status(400).json({
         error: 'All fields are required. Please complete all steps.'
       });
@@ -753,7 +786,7 @@ app.post('/api/onboarding', auth, async (req, res) => {
   try {
     const userId = req.user.id;
     console.log('📝 Saving onboarding for user:', userId);
-    
+
     const {
       qualification,
       year,
@@ -781,10 +814,10 @@ app.post('/api/onboarding', auth, async (req, res) => {
     });
 
     // Validate required fields
-    if (!qualification || !year || !academicGoal || !learningStyle || 
-        !studyChallenges || studyChallenges.length < 2 || !studyHours || 
-        !productiveTime || !reminderFrequency || !aiSupport || 
-        !resourceRecommendations) {
+    if (!qualification || !year || !academicGoal || !learningStyle ||
+      !studyChallenges || studyChallenges.length < 2 || !studyHours ||
+      !productiveTime || !reminderFrequency || !aiSupport ||
+      !resourceRecommendations) {
       console.log('❌ Validation failed: Missing required fields');
       return res.status(400).json({
         error: 'All fields are required. Please complete all steps.'
@@ -922,7 +955,7 @@ app.post('/api/onboarding', auth, async (req, res) => {
     console.error('❌ Error saving onboarding profile:', error);
     console.error('❌ Error details:', error.message);
     console.error('❌ Stack trace:', error.stack);
-    
+
     // Return a proper error response
     res.status(500).json({
       error: 'Failed to save onboarding profile. Please try again.',
@@ -933,8 +966,8 @@ app.post('/api/onboarding', auth, async (req, res) => {
 
 // 8. Health check
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     emailProvider: 'Mailgun',
     verificationMethod: 'Code-based'
@@ -982,17 +1015,17 @@ app.get('/api/db-status', async (req, res) => {
 app.get('/api/debug-user', auth, async (req, res) => {
   try {
     const userId = req.user.id;
-    
+
     // Check users table
     const userResult = await sql`
       SELECT * FROM users WHERE id = ${userId}
     `;
-    
+
     // Check user_profiles table
     const profileResult = await sql`
       SELECT * FROM user_profiles WHERE user_id = ${userId}
     `;
-    
+
     // Check if user_profiles table exists
     const tableCheck = await sql`
       SELECT EXISTS (
@@ -1001,7 +1034,7 @@ app.get('/api/debug-user', auth, async (req, res) => {
         AND table_name = 'user_profiles'
       )
     `;
-    
+
     res.json({
       user: userResult[0] || null,
       profile: profileResult[0] || null,
@@ -1032,7 +1065,7 @@ const startServer = async () => {
   try {
     // Initialize database tables
     await initializeDatabase();
-    
+
     // Start the server
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`\n🚀 Server running on port ${PORT}`);
