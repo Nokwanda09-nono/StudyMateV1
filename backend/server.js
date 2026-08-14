@@ -6,6 +6,14 @@ const { neon } = require('@neondatabase/serverless');
 const { mg, DOMAIN, FROM_EMAIL } = require('./mailgun.config');
 require('dotenv').config();
 
+// Development defaults for quick local testing (do NOT use in production).
+if (process.env.NODE_ENV !== 'production') {
+  process.env.DEV_USER_EMAIL = process.env.DEV_USER_EMAIL || 'test@example.com';
+  process.env.DEV_USER_PASSWORD = process.env.DEV_USER_PASSWORD || 'password123';
+  process.env.DEV_USER_FIRSTNAME = process.env.DEV_USER_FIRSTNAME || 'Dev';
+  process.env.DEV_USER_LASTNAME = process.env.DEV_USER_LASTNAME || 'User';
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -17,7 +25,17 @@ app.use(cors({
 app.use(express.json());
 
 // Neon Database Connection
-const sql = neon(process.env.DATABASE_URL);
+let sql;
+if (process.env.DATABASE_URL) {
+  sql = neon(process.env.DATABASE_URL);
+} else {
+  console.warn('⚠️ DATABASE_URL not set. Database calls will fail until configured.');
+  // Provide a stub that matches the tagged-template usage (e.g., sql`SELECT ...`).
+  // This stub will throw a clear error when used, but prevents startup crashes.
+  sql = async function() {
+    throw new Error('No DATABASE_URL configured. Set DATABASE_URL in environment.');
+  };
+}
 
 // Auto-migration helper for database tables
 const initDb = async () => {
@@ -241,9 +259,34 @@ app.post('/api/verify-code', async (req, res) => {
       return res.status(400).json({ error: 'Email and verification code are required' });
     }
 
-    const user = await sql`
-      SELECT * FROM users WHERE email = ${email.toLowerCase()}
-    `;
+    let user;
+    try {
+      user = await sql`
+        SELECT * FROM users WHERE email = ${email.toLowerCase()}
+      `;
+    } catch (dbErr) {
+      console.warn('Database query failed during login:', dbErr && dbErr.message ? dbErr.message : dbErr);
+      // Development fallback: allow a dev user when DATABASE_URL isn't configured.
+      // To enable locally, set DEV_USER_EMAIL and DEV_USER_PASSWORD environment variables.
+      if (process.env.NODE_ENV !== 'production' && process.env.DEV_USER_EMAIL && process.env.DEV_USER_PASSWORD) {
+        if (email.toLowerCase() === process.env.DEV_USER_EMAIL.toLowerCase()) {
+          // Create a fake user object shaped like the DB result to continue the flow.
+          user = [{
+            id: '00000000-0000-0000-0000-000000000000',
+            first_name: process.env.DEV_USER_FIRSTNAME || 'Dev',
+            last_name: process.env.DEV_USER_LASTNAME || 'User',
+            email: process.env.DEV_USER_EMAIL.toLowerCase(),
+            password_hash: await bcrypt.hash(process.env.DEV_USER_PASSWORD, 10),
+            email_verified: true,
+            onboarding_completed: false
+          }];
+        } else {
+          user = [];
+        }
+      } else {
+        throw dbErr;
+      }
+    }
 
     if (user.length === 0) {
       return res.status(404).json({ error: 'User not found' });
@@ -470,8 +513,10 @@ app.post('/api/login', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Server error during login' });
+    console.error('Login error:', error && error.stack ? error.stack : error);
+    // Include error message in response during development to aid debugging.
+    // Remove `details` in production to avoid leaking internals.
+    res.status(500).json({ error: 'Server error during login', details: error && error.message ? error.message : String(error) });
   }
 });
 
@@ -679,6 +724,27 @@ app.get('/api/health', (req, res) => {
     verificationMethod: 'Code-based'
   });
 });
+
+// Development helper: return a JWT for the dev user (only in non-production)
+if (process.env.NODE_ENV !== 'production') {
+  app.post('/api/dev-token', (req, res) => {
+    const email = process.env.DEV_USER_EMAIL;
+    if (!email) return res.status(400).json({ error: 'DEV_USER_EMAIL not configured' });
+
+    const token = jwt.sign(
+      {
+        userId: '00000000-0000-0000-0000-000000000000',
+        email: email.toLowerCase(),
+        firstName: process.env.DEV_USER_FIRSTNAME || 'Dev',
+        lastName: process.env.DEV_USER_LASTNAME || 'User'
+      },
+      process.env.JWT_SECRET || 'secret',
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, user: { email: email.toLowerCase(), firstName: process.env.DEV_USER_FIRSTNAME || 'Dev', lastName: process.env.DEV_USER_LASTNAME || 'User' } });
+  });
+}
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
