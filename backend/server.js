@@ -16,10 +16,11 @@ if (process.env.NODE_ENV !== 'production') {
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key';
 
 // Middleware
 app.use(cors({
-  origin: '*',
+  origin: 'http://localhost:8081',
   credentials: true
 }));
 app.use(express.json());
@@ -37,52 +38,217 @@ if (process.env.DATABASE_URL) {
   };
 }
 
-// Auto-migration helper for database tables
-const initDb = async () => {
+// ==================== DATABASE INITIALIZATION ====================
+
+/**
+ * Create tables if they don't exist
+ * This runs automatically when the server starts
+ */
+const initializeDatabase = async () => {
   try {
+    console.log('🔧 Initializing database tables...');
+
+    // Create users table
     await sql`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE;
-    `;
-    await sql`
-      CREATE TABLE IF NOT EXISTS onboarding_profiles (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-        qualification VARCHAR(100),
-        year VARCHAR(50),
-        academic_goal VARCHAR(100),
-        learning_style VARCHAR(100),
-        study_challenges TEXT[],
-        study_hours VARCHAR(50),
-        productive_time VARCHAR(100),
-        reminder_frequency VARCHAR(50),
-        ai_support VARCHAR(100),
-        resource_recommendations VARCHAR(100),
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
+        email_verified BOOLEAN DEFAULT FALSE,
+        onboarding_completed BOOLEAN DEFAULT FALSE,
+        verification_code VARCHAR(6),
+        verification_code_expires TIMESTAMP,
+        verification_attempts INTEGER DEFAULT 0,
+        role VARCHAR(50) DEFAULT 'user',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+      )
     `;
-    console.log('✅ Database schema verified');
-  } catch (err) {
-    console.error('⚠️ DB init note:', err.message);
+
+    // Add missing columns for existing deployments created from older schemas
+    await sql`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS first_name VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS last_name VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS verification_code VARCHAR(6),
+      ADD COLUMN IF NOT EXISTS verification_code_expires TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS verification_attempts INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'user',
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    `;
+    console.log('✅ Users table ready');
+
+    // Create user_profiles table
+    await sql`
+      CREATE TABLE IF NOT EXISTS user_profiles (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        qualification VARCHAR(50) NOT NULL,
+        year VARCHAR(50) NOT NULL,
+        academic_goal VARCHAR(50) NOT NULL,
+        learning_style VARCHAR(50) NOT NULL,
+        study_challenges JSONB NOT NULL,
+        study_hours VARCHAR(50) NOT NULL,
+        productive_time VARCHAR(50) NOT NULL,
+        reminder_frequency VARCHAR(50) NOT NULL,
+        ai_support VARCHAR(50) NOT NULL,
+        resource_recommendations VARCHAR(10) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id)
+      )
+    `;
+    console.log('✅ User profiles table ready');
+
+    // Create indexes for better performance
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)
+    `;
+    console.log('✅ Users email index ready');
+
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_users_onboarding ON users(onboarding_completed)
+    `;
+    console.log('✅ Users onboarding index ready');
+
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id)
+    `;
+    console.log('✅ User profiles index ready');
+
+    // Create function to update updated_at timestamp
+    await sql`
+      CREATE OR REPLACE FUNCTION update_updated_at_column()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+      END;
+      $$ language 'plpgsql'
+    `;
+    console.log('✅ Update timestamp function ready');
+
+    // Create triggers for updated_at
+    await sql`
+      DROP TRIGGER IF EXISTS update_users_updated_at ON users
+    `;
+    await sql`
+      CREATE TRIGGER update_users_updated_at 
+        BEFORE UPDATE ON users 
+        FOR EACH ROW 
+        EXECUTE FUNCTION update_updated_at_column()
+    `;
+    console.log('✅ Users trigger ready');
+
+    await sql`
+      DROP TRIGGER IF EXISTS update_user_profiles_updated_at ON user_profiles
+    `;
+    await sql`
+      CREATE TRIGGER update_user_profiles_updated_at 
+        BEFORE UPDATE ON user_profiles 
+        FOR EACH ROW 
+        EXECUTE FUNCTION update_updated_at_column()
+    `;
+    console.log('✅ User profiles trigger ready');
+
+    console.log('🎉 Database initialization complete!');
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    // Don't exit the process, just log the error
+    // The server will still start but some features might not work
   }
 };
-initDb();
 
-// Authentication middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication token required' });
-  }
+// ==================== AUTHENTICATION MIDDLEWARE ====================
 
-  jwt.verify(token, process.env.JWT_SECRET || 'secret', (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
+/**
+ * Authentication Middleware
+ * Verifies JWT token and attaches user to request
+ */
+const auth = async (req, res, next) => {
+  try {
+    // Get token from Authorization header
+    const authHeader = req.header('Authorization');
+
+    if (!authHeader) {
+      return res.status(401).json({
+        error: 'No authentication token provided'
+      });
     }
-    req.user = user;
+
+    // Check if it's a Bearer token
+    const parts = authHeader.split(' ');
+    if (parts.length !== 2 || parts[0] !== 'Bearer') {
+      return res.status(401).json({
+        error: 'Invalid authorization format. Use Bearer token.'
+      });
+    }
+
+    const token = parts[1];
+
+    // Verify token
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (jwtError) {
+      if (jwtError.name === 'TokenExpiredError') {
+        return res.status(401).json({
+          error: 'Token has expired. Please login again.'
+        });
+      }
+      if (jwtError.name === 'JsonWebTokenError') {
+        return res.status(401).json({
+          error: 'Invalid token. Please login again.'
+        });
+      }
+      throw jwtError;
+    }
+
+    // Get user from database using Neon SQL
+    const userResult = await sql`
+      SELECT id, email, first_name, last_name, email_verified, onboarding_completed 
+      FROM users 
+      WHERE id = ${decoded.userId}
+    `;
+
+    if (userResult.length === 0) {
+      return res.status(401).json({
+        error: 'User not found. Please login again.'
+      });
+    }
+
+    const user = userResult[0];
+
+    // Check if email is verified
+    if (!user.email_verified) {
+      return res.status(403).json({
+        error: 'Please verify your email before accessing this resource'
+      });
+    }
+
+    // Attach user to request
+    req.user = {
+      id: user.id,
+      email: user.email,
+      firstName: user.first_name,
+      lastName: user.last_name,
+      emailVerified: user.email_verified,
+      onboardingCompleted: user.onboarding_completed
+    };
+
     next();
-  });
+  } catch (error) {
+    console.error('Auth middleware error:', error);
+    res.status(500).json({
+      error: 'Authentication failed. Please try again.'
+    });
+  }
 };
 
 // Helper function to generate a 6-digit verification code
@@ -164,29 +330,40 @@ app.post('/api/register', async (req, res) => {
   try {
     const { firstName, lastName, email, password } = req.body;
 
+    // Validation
     if (!firstName || !lastName || !email || !password) {
-      return res.status(400).json({ error: 'All fields are required' });
+      return res.status(400).json({
+        error: 'All fields are required'
+      });
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      return res.status(400).json({
+        error: 'Password must be at least 6 characters'
+      });
     }
 
+    // Check if user already exists
     const existingUser = await sql`
       SELECT * FROM users WHERE email = ${email.toLowerCase()}
     `;
 
     if (existingUser.length > 0) {
-      return res.status(400).json({ error: 'User with this email already exists' });
+      return res.status(400).json({
+        error: 'User with this email already exists'
+      });
     }
 
+    // Hash password
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
+    // Generate verification code
     const verificationCode = generateVerificationCode();
     const codeExpires = new Date();
-    codeExpires.setMinutes(codeExpires.getMinutes() + 15);
+    codeExpires.setMinutes(codeExpires.getMinutes() + 15); // 15 minutes expiry
 
+    // Insert user into database
     const result = await sql`
       INSERT INTO users (
         first_name, 
@@ -195,8 +372,7 @@ app.post('/api/register', async (req, res) => {
         password_hash, 
         verification_code,
         verification_code_expires,
-        verification_attempts,
-        onboarding_completed
+        verification_attempts
       )
       VALUES (
         ${firstName}, 
@@ -205,60 +381,49 @@ app.post('/api/register', async (req, res) => {
         ${passwordHash}, 
         ${verificationCode},
         ${codeExpires},
-        0,
-        FALSE
+        0
       )
-      RETURNING id, email, first_name, last_name, email_verified, onboarding_completed
+      RETURNING id, email, first_name, last_name, email_verified
     `;
 
     const newUser = result[0];
 
+    // Send verification code email
     try {
       await sendVerificationCodeEmail(email, firstName, verificationCode);
     } catch (emailError) {
       console.error('Email sending failed:', emailError);
       return res.status(201).json({
         message: 'Registration successful but email sending failed. Please request a new code.',
-        user: {
-          id: newUser.id,
-          firstName: newUser.first_name,
-          lastName: newUser.last_name,
-          email: newUser.email,
-          emailVerified: false,
-          onboardingCompleted: false
-        },
+        user: newUser,
         emailSent: false
       });
     }
 
     res.status(201).json({
       message: 'Registration successful! Please check your email for the verification code.',
-      user: {
-        id: newUser.id,
-        firstName: newUser.first_name,
-        lastName: newUser.last_name,
-        email: newUser.email,
-        emailVerified: false,
-        onboardingCompleted: false
-      },
+      user: newUser,
       emailSent: true,
     });
 
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Server error during registration' });
+    res.status(500).json({
+      error: 'Server error during registration'
+    });
   }
 });
 
-// 2. Verify Code Route - Verifies and automatically logs user in
+// 2. Verify Code Route
 app.post('/api/verify-code', async (req, res) => {
   try {
     const { email, code } = req.body;
 
     if (!email || !code) {
-      return res.status(400).json({ error: 'Email and verification code are required' });
+      return res.status(400).json({
+        error: 'Email and verification code are required'
+      });
     }
-
     let user;
     try {
       user = await sql`
@@ -289,37 +454,21 @@ app.post('/api/verify-code', async (req, res) => {
     }
 
     if (user.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    if (user[0].email_verified) {
-      const token = jwt.sign(
-        { 
-          userId: user[0].id, 
-          email: user[0].email,
-          firstName: user[0].first_name,
-          lastName: user[0].last_name
-        },
-        process.env.JWT_SECRET || 'secret',
-        { expiresIn: '7d' }
-      );
-
-      return res.json({
-        message: 'Email already verified. Logging in.',
-        verified: true,
-        token,
-        user: {
-          id: user[0].id,
-          firstName: user[0].first_name,
-          lastName: user[0].last_name,
-          email: user[0].email,
-          emailVerified: true,
-          onboardingCompleted: Boolean(user[0].onboarding_completed)
-        }
+      return res.status(404).json({
+        error: 'User not found'
       });
     }
 
+    // Check if already verified
+    if (user[0].email_verified) {
+      return res.status(400).json({
+        error: 'Email already verified'
+      });
+    }
+
+    // Check if code matches
     if (user[0].verification_code !== code) {
+      // Increment verification attempts
       await sql`
         UPDATE users 
         SET verification_attempts = verification_attempts + 1
@@ -327,22 +476,24 @@ app.post('/api/verify-code', async (req, res) => {
       `;
 
       const attempts = user[0].verification_attempts + 1;
-      
+
+      // Lock account after 5 failed attempts
       if (attempts >= 5) {
-        return res.status(403).json({ 
+        return res.status(403).json({
           error: 'Too many failed attempts. Please request a new verification code.',
           locked: true
         });
       }
 
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Invalid verification code',
         attemptsRemaining: 5 - attempts
       });
     }
 
+    // Check if code is expired
     if (new Date(user[0].verification_code_expires) < new Date()) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Verification code has expired. Please request a new one.',
         expired: true
       });
@@ -360,35 +511,16 @@ app.post('/api/verify-code', async (req, res) => {
       WHERE id = ${user[0].id}
     `;
 
-    // Generate JWT token for immediate auto-login after verification
-    const token = jwt.sign(
-      { 
-        userId: user[0].id, 
-        email: user[0].email,
-        firstName: user[0].first_name,
-        lastName: user[0].last_name
-      },
-      process.env.JWT_SECRET || 'secret',
-      { expiresIn: '7d' }
-    );
-
     res.json({
-      message: 'Email verified successfully!',
-      verified: true,
-      token,
-      user: {
-        id: user[0].id,
-        firstName: user[0].first_name,
-        lastName: user[0].last_name,
-        email: user[0].email,
-        emailVerified: true,
-        onboardingCompleted: Boolean(user[0].onboarding_completed)
-      }
+      message: 'Email verified successfully! You can now log in.',
+      verified: true
     });
 
   } catch (error) {
     console.error('Code verification error:', error);
-    res.status(500).json({ error: 'Server error during verification' });
+    res.status(500).json({
+      error: 'Server error during verification'
+    });
   }
 });
 
@@ -401,6 +533,7 @@ app.post('/api/resend-verification', async (req, res) => {
       return res.status(400).json({ error: 'Email is required' });
     }
 
+    // Find user
     const user = await sql`
       SELECT * FROM users WHERE email = ${email.toLowerCase()}
     `;
@@ -413,7 +546,9 @@ app.post('/api/resend-verification', async (req, res) => {
       return res.status(400).json({ error: 'Email already verified' });
     }
 
+    // Check if user has been locked out
     if (user[0].verification_attempts >= 5) {
+      // Reset attempts but still warn
       await sql`
         UPDATE users 
         SET verification_attempts = 0
@@ -421,10 +556,12 @@ app.post('/api/resend-verification', async (req, res) => {
       `;
     }
 
+    // Generate new verification code
     const verificationCode = generateVerificationCode();
     const codeExpires = new Date();
     codeExpires.setMinutes(codeExpires.getMinutes() + 15);
 
+    // Update user with new code
     await sql`
       UPDATE users 
       SET 
@@ -433,13 +570,18 @@ app.post('/api/resend-verification', async (req, res) => {
       WHERE id = ${user[0].id}
     `;
 
+    // Send new verification code
     await sendVerificationCodeEmail(email, user[0].first_name, verificationCode);
 
-    res.json({ message: 'New verification code sent successfully' });
+    res.json({
+      message: 'New verification code sent successfully'
+    });
 
   } catch (error) {
     console.error('Resend verification error:', error);
-    res.status(500).json({ error: 'Server error while resending verification' });
+    res.status(500).json({
+      error: 'Server error while resending verification'
+    });
   }
 });
 
@@ -452,77 +594,83 @@ app.post('/api/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
+    // Find user
     const user = await sql`
-      SELECT * FROM users WHERE email = ${email.toLowerCase()}
+      SELECT id, email, password_hash, first_name, last_name, email_verified, onboarding_completed
+      FROM users
+      WHERE email = ${String(email).toLowerCase().trim()}
     `;
 
     if (user.length === 0) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    if (!user[0].email_verified) {
-      return res.status(403).json({ 
-        error: 'Please verify your email before logging in',
-        requiresVerification: true 
+    const userRecord = user[0];
+    if (!userRecord.password_hash) {
+      return res.status(500).json({
+        error: 'Account data is incomplete. Please contact support or re-register.'
       });
     }
 
-    const validPassword = await bcrypt.compare(password, user[0].password_hash);
+    // Check if email is verified
+    if (!userRecord.email_verified) {
+      return res.status(403).json({
+        error: 'Please verify your email before logging in',
+        requiresVerification: true
+      });
+    }
+
+    // Verify password
+    const validPassword = await bcrypt.compare(password, userRecord.password_hash);
     if (!validPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    // Generate JWT token
     const token = jwt.sign(
-      { 
-        userId: user[0].id, 
-        email: user[0].email,
-        firstName: user[0].first_name,
-        lastName: user[0].last_name
+      {
+        userId: userRecord.id,
+        email: userRecord.email,
+        firstName: userRecord.first_name,
+        lastName: userRecord.last_name
       },
-      process.env.JWT_SECRET || 'secret',
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
-
-    const profile = await sql`
-      SELECT * FROM onboarding_profiles WHERE user_id = ${user[0].id}
-    `;
 
     res.json({
       message: 'Login successful',
       token,
       user: {
-        id: user[0].id,
-        firstName: user[0].first_name,
-        lastName: user[0].last_name,
-        email: user[0].email,
-        emailVerified: Boolean(user[0].email_verified),
-        onboardingCompleted: Boolean(user[0].onboarding_completed),
-        profile: profile.length > 0 ? {
-          qualification: profile[0].qualification,
-          year: profile[0].year,
-          academicGoal: profile[0].academic_goal,
-          learningStyle: profile[0].learning_style,
-          studyChallenges: profile[0].study_challenges || [],
-          studyHours: profile[0].study_hours,
-          productiveTime: profile[0].productive_time,
-          reminderFrequency: profile[0].reminder_frequency,
-          aiSupport: profile[0].ai_support,
-          resourceRecommendations: profile[0].resource_recommendations
-        } : null
+        id: userRecord.id,
+        firstName: userRecord.first_name,
+        lastName: userRecord.last_name,
+        email: userRecord.email,
+        emailVerified: userRecord.email_verified,
+        onboardingCompleted: userRecord.onboarding_completed || false
       }
     });
 
   } catch (error) {
-    console.error('Login error:', error && error.stack ? error.stack : error);
-    // Include error message in response during development to aid debugging.
-    // Remove `details` in production to avoid leaking internals.
-    res.status(500).json({ error: 'Server error during login', details: error && error.message ? error.message : String(error) });
+    console.error('❌ Login error:', {
+      message: error?.message || String(error),
+      stack: error?.stack,
+      code: error?.code,
+      detail: error?.detail
+    });
+    res.status(500).json({
+      error: 'Server error during login',
+      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+    });
   }
-});
+})
 
-// 5. Save Onboarding Profile Route
-app.post('/api/onboarding', authenticateToken, async (req, res) => {
+// ==================== ONBOARDING ROUTES ====================
+
+// 5. Save onboarding profile
+app.post('/api/onboarding', auth, async (req, res) => {
   try {
+    const userId = req.user.id;
     const {
       qualification,
       year,
@@ -536,189 +684,331 @@ app.post('/api/onboarding', authenticateToken, async (req, res) => {
       resourceRecommendations
     } = req.body;
 
-    const userId = req.user.userId;
-
-    await sql`
-      INSERT INTO onboarding_profiles (
-        user_id, qualification, year, academic_goal, learning_style,
-        study_challenges, study_hours, productive_time, reminder_frequency,
-        ai_support, resource_recommendations, updated_at
-      ) VALUES (
-        ${userId}, ${qualification || ''}, ${year || ''}, ${academicGoal || ''},
-        ${learningStyle || ''}, ${studyChallenges || []}, ${studyHours || ''},
-        ${productiveTime || ''}, ${reminderFrequency || ''}, ${aiSupport || ''},
-        ${resourceRecommendations || ''}, NOW()
-      )
-      ON CONFLICT (user_id) DO UPDATE SET
-        qualification = EXCLUDED.qualification,
-        year = EXCLUDED.year,
-        academic_goal = EXCLUDED.academic_goal,
-        learning_style = EXCLUDED.learning_style,
-        study_challenges = EXCLUDED.study_challenges,
-        study_hours = EXCLUDED.study_hours,
-        productive_time = EXCLUDED.productive_time,
-        reminder_frequency = EXCLUDED.reminder_frequency,
-        ai_support = EXCLUDED.ai_support,
-        resource_recommendations = EXCLUDED.resource_recommendations,
-        updated_at = NOW()
-    `;
-
-    const updatedUser = await sql`
-      UPDATE users
-      SET onboarding_completed = TRUE, updated_at = NOW()
-      WHERE id = ${userId}
-      RETURNING id, first_name, last_name, email, email_verified, onboarding_completed
-    `;
-
-    const savedProfile = {
-      qualification: qualification || '',
-      year: year || '',
-      academicGoal: academicGoal || '',
-      learningStyle: learningStyle || '',
-      studyChallenges: studyChallenges || [],
-      studyHours: studyHours || '',
-      productiveTime: productiveTime || '',
-      reminderFrequency: reminderFrequency || '',
-      aiSupport: aiSupport || '',
-      resourceRecommendations: resourceRecommendations || ''
-    };
-
-    res.json({
-      success: true,
-      message: 'Onboarding profile saved successfully',
-      user: {
-        id: updatedUser[0].id,
-        firstName: updatedUser[0].first_name,
-        lastName: updatedUser[0].last_name,
-        email: updatedUser[0].email,
-        emailVerified: Boolean(updatedUser[0].email_verified),
-        onboardingCompleted: true,
-        profile: savedProfile
-      },
-      profile: savedProfile
-    });
-
-  } catch (error) {
-    console.error('Save onboarding error:', error);
-    res.status(500).json({ error: 'Server error while saving onboarding profile' });
-  }
-});
-
-// 6. Get Onboarding Profile Route
-app.get('/api/onboarding', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const profile = await sql`
-      SELECT * FROM onboarding_profiles WHERE user_id = ${userId}
-    `;
-
-    if (profile.length === 0) {
-      return res.status(404).json({ error: 'Profile not found' });
+    // Validate required fields
+    if (!qualification || !year || !academicGoal || !learningStyle ||
+      !studyChallenges || studyChallenges.length < 2 || !studyHours ||
+      !productiveTime || !reminderFrequency || !aiSupport ||
+      !resourceRecommendations) {
+      return res.status(400).json({
+        error: 'All fields are required. Please complete all steps.'
+      });
     }
 
-    res.json({
-      success: true,
-      profile: {
-        qualification: profile[0].qualification,
-        year: profile[0].year,
-        academicGoal: profile[0].academic_goal,
-        learningStyle: profile[0].learning_style,
-        studyChallenges: profile[0].study_challenges || [],
-        studyHours: profile[0].study_hours,
-        productiveTime: profile[0].productive_time,
-        reminderFrequency: profile[0].reminder_frequency,
-        aiSupport: profile[0].ai_support,
-        resourceRecommendations: profile[0].resource_recommendations
-      }
-    });
-  } catch (error) {
-    console.error('Fetch onboarding error:', error);
-    res.status(500).json({ error: 'Server error while fetching onboarding profile' });
-  }
-});
+    // Check if user already has a profile using Neon SQL
+    const existingProfile = await sql`
+      SELECT id FROM user_profiles WHERE user_id = ${userId}
+    `;
 
-// 7. Update Profile Route
-app.put('/api/profile', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { firstName, lastName, qualification, year, academicGoal, learningStyle, studyChallenges, studyHours, productiveTime, reminderFrequency, aiSupport, resourceRecommendations } = req.body;
-
-    if (firstName !== undefined || lastName !== undefined) {
-      await sql`
-        UPDATE users
+    let result;
+    if (existingProfile.length > 0) {
+      // Update existing profile
+      result = await sql`
+        UPDATE user_profiles 
         SET 
-          first_name = COALESCE(${firstName}, first_name),
-          last_name = COALESCE(${lastName}, last_name),
+          qualification = ${qualification},
+          year = ${year},
+          academic_goal = ${academicGoal},
+          learning_style = ${learningStyle},
+          study_challenges = ${JSON.stringify(studyChallenges)},
+          study_hours = ${studyHours},
+          productive_time = ${productiveTime},
+          reminder_frequency = ${reminderFrequency},
+          ai_support = ${aiSupport},
+          resource_recommendations = ${resourceRecommendations},
           updated_at = NOW()
-        WHERE id = ${userId}
+        WHERE user_id = ${userId}
+        RETURNING *
+      `;
+    } else {
+      // Create new profile
+      result = await sql`
+        INSERT INTO user_profiles (
+          user_id,
+          qualification,
+          year,
+          academic_goal,
+          learning_style,
+          study_challenges,
+          study_hours,
+          productive_time,
+          reminder_frequency,
+          ai_support,
+          resource_recommendations,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${userId},
+          ${qualification},
+          ${year},
+          ${academicGoal},
+          ${learningStyle},
+          ${JSON.stringify(studyChallenges)},
+          ${studyHours},
+          ${productiveTime},
+          ${reminderFrequency},
+          ${aiSupport},
+          ${resourceRecommendations},
+          NOW(),
+          NOW()
+        )
+        RETURNING *
       `;
     }
 
+    // Update user's onboarding status
     await sql`
-      INSERT INTO onboarding_profiles (
-        user_id, qualification, year, academic_goal, learning_style,
-        study_challenges, study_hours, productive_time, reminder_frequency,
-        ai_support, resource_recommendations, updated_at
-      ) VALUES (
-        ${userId}, ${qualification || ''}, ${year || ''}, ${academicGoal || ''},
-        ${learningStyle || ''}, ${studyChallenges || []}, ${studyHours || ''},
-        ${productiveTime || ''}, ${reminderFrequency || ''}, ${aiSupport || ''},
-        ${resourceRecommendations || ''}, NOW()
-      )
-      ON CONFLICT (user_id) DO UPDATE SET
-        qualification = COALESCE(EXCLUDED.qualification, onboarding_profiles.qualification),
-        year = COALESCE(EXCLUDED.year, onboarding_profiles.year),
-        academic_goal = COALESCE(EXCLUDED.academic_goal, onboarding_profiles.academic_goal),
-        learning_style = COALESCE(EXCLUDED.learning_style, onboarding_profiles.learning_style),
-        study_challenges = COALESCE(EXCLUDED.study_challenges, onboarding_profiles.study_challenges),
-        study_hours = COALESCE(EXCLUDED.study_hours, onboarding_profiles.study_hours),
-        productive_time = COALESCE(EXCLUDED.productive_time, onboarding_profiles.productive_time),
-        reminder_frequency = COALESCE(EXCLUDED.reminder_frequency, onboarding_profiles.reminder_frequency),
-        ai_support = COALESCE(EXCLUDED.ai_support, onboarding_profiles.ai_support),
-        resource_recommendations = COALESCE(EXCLUDED.resource_recommendations, onboarding_profiles.resource_recommendations),
-        updated_at = NOW()
+      UPDATE users SET onboarding_completed = TRUE WHERE id = ${userId}
     `;
 
-    const userRes = await sql`SELECT * FROM users WHERE id = ${userId}`;
-    const profileRes = await sql`SELECT * FROM onboarding_profiles WHERE user_id = ${userId}`;
+    // Get updated user data
+    const userResult = await sql`
+      SELECT id, email, first_name, last_name, onboarding_completed 
+      FROM users 
+      WHERE id = ${userId}
+    `;
 
-    const profileObj = profileRes.length > 0 ? {
-      qualification: profileRes[0].qualification,
-      year: profileRes[0].year,
-      academicGoal: profileRes[0].academic_goal,
-      learningStyle: profileRes[0].learning_style,
-      studyChallenges: profileRes[0].study_challenges || [],
-      studyHours: profileRes[0].study_hours,
-      productiveTime: profileRes[0].productive_time,
-      reminderFrequency: profileRes[0].reminder_frequency,
-      aiSupport: profileRes[0].ai_support,
-      resourceRecommendations: profileRes[0].resource_recommendations
-    } : null;
+    // Parse study_challenges back to array for response
+    const profileData = result[0];
+    if (profileData.study_challenges) {
+      profileData.study_challenges = JSON.parse(profileData.study_challenges);
+    }
 
-    res.json({
+    res.status(200).json({
       success: true,
-      message: 'Profile updated successfully',
-      user: {
-        id: userRes[0].id,
-        firstName: userRes[0].first_name,
-        lastName: userRes[0].last_name,
-        email: userRes[0].email,
-        emailVerified: Boolean(userRes[0].email_verified),
-        onboardingCompleted: Boolean(userRes[0].onboarding_completed),
-        profile: profileObj
-      },
-      profile: profileObj
+      profile: profileData,
+      user: userResult[0],
+      message: 'Onboarding completed successfully'
     });
+
   } catch (error) {
-    console.error('Update profile error:', error);
-    res.status(500).json({ error: 'Server error while updating profile' });
+    console.error('Error saving onboarding profile:', error);
+    res.status(500).json({
+      error: 'Failed to save onboarding profile. Please try again.'
+    });
   }
 });
 
-// Health check
+// 6. Get onboarding profile
+app.get('/api/onboarding', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await sql`
+      SELECT * FROM user_profiles WHERE user_id = ${userId}
+    `;
+
+    if (result.length === 0) {
+      return res.status(404).json({
+        error: 'Profile not found'
+      });
+    }
+
+    const profile = result[0];
+    // Parse JSON fields
+    if (profile.study_challenges) {
+      profile.study_challenges = JSON.parse(profile.study_challenges);
+    }
+
+    res.status(200).json({
+      success: true,
+      profile
+    });
+
+  } catch (error) {
+    console.error('Error fetching onboarding profile:', error);
+    res.status(500).json({
+      error: 'Failed to fetch onboarding profile'
+    });
+  }
+});
+
+// 7. Update onboarding profile
+app.post('/api/onboarding', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    console.log('📝 Saving onboarding for user:', userId);
+
+    const {
+      qualification,
+      year,
+      academicGoal,
+      learningStyle,
+      studyChallenges,
+      studyHours,
+      productiveTime,
+      reminderFrequency,
+      aiSupport,
+      resourceRecommendations
+    } = req.body;
+
+    console.log('📊 Received profile data:', {
+      qualification,
+      year,
+      academicGoal,
+      learningStyle,
+      studyChallenges: studyChallenges?.length,
+      studyHours,
+      productiveTime,
+      reminderFrequency,
+      aiSupport,
+      resourceRecommendations
+    });
+
+    // Validate required fields
+    if (!qualification || !year || !academicGoal || !learningStyle ||
+      !studyChallenges || studyChallenges.length < 2 || !studyHours ||
+      !productiveTime || !reminderFrequency || !aiSupport ||
+      !resourceRecommendations) {
+      console.log('❌ Validation failed: Missing required fields');
+      return res.status(400).json({
+        error: 'All fields are required. Please complete all steps.'
+      });
+    }
+
+    // Check if user already has a profile
+    let existingProfile;
+    try {
+      existingProfile = await sql`
+        SELECT id FROM user_profiles WHERE user_id = ${userId}
+      `;
+      console.log('📋 Existing profile:', existingProfile.length > 0 ? 'Found' : 'Not found');
+    } catch (dbError) {
+      console.error('❌ Error checking existing profile:', dbError);
+      // If table doesn't exist, we'll create it
+      existingProfile = [];
+    }
+
+    let result;
+    if (existingProfile && existingProfile.length > 0) {
+      // Update existing profile
+      console.log('🔄 Updating existing profile...');
+      try {
+        result = await sql`
+          UPDATE user_profiles 
+          SET 
+            qualification = ${qualification},
+            year = ${year},
+            academic_goal = ${academicGoal},
+            learning_style = ${learningStyle},
+            study_challenges = ${JSON.stringify(studyChallenges)}::jsonb,
+            study_hours = ${studyHours},
+            productive_time = ${productiveTime},
+            reminder_frequency = ${reminderFrequency},
+            ai_support = ${aiSupport},
+            resource_recommendations = ${resourceRecommendations},
+            updated_at = NOW()
+          WHERE user_id = ${userId}
+          RETURNING *
+        `;
+        console.log('✅ Profile updated successfully');
+      } catch (updateError) {
+        console.error('❌ Error updating profile:', updateError);
+        throw new Error('Failed to update profile: ' + updateError.message);
+      }
+    } else {
+      // Create new profile
+      console.log('📝 Creating new profile...');
+      try {
+        result = await sql`
+          INSERT INTO user_profiles (
+            user_id,
+            qualification,
+            year,
+            academic_goal,
+            learning_style,
+            study_challenges,
+            study_hours,
+            productive_time,
+            reminder_frequency,
+            ai_support,
+            resource_recommendations,
+            created_at,
+            updated_at
+          ) VALUES (
+            ${userId},
+            ${qualification},
+            ${year},
+            ${academicGoal},
+            ${learningStyle},
+            ${JSON.stringify(studyChallenges)}::jsonb,
+            ${studyHours},
+            ${productiveTime},
+            ${reminderFrequency},
+            ${aiSupport},
+            ${resourceRecommendations},
+            NOW(),
+            NOW()
+          )
+          RETURNING *
+        `;
+        console.log('✅ Profile created successfully');
+      } catch (insertError) {
+        console.error('❌ Error creating profile:', insertError);
+        throw new Error('Failed to create profile: ' + insertError.message);
+      }
+    }
+
+    // Update user's onboarding status
+    try {
+      await sql`
+        UPDATE users SET onboarding_completed = TRUE WHERE id = ${userId}
+      `;
+      console.log('✅ User onboarding status updated');
+    } catch (updateUserError) {
+      console.error('❌ Error updating user status:', updateUserError);
+      // Don't throw here, just log the error
+    }
+
+    // Get updated user data
+    let userResult;
+    try {
+      userResult = await sql`
+        SELECT id, email, first_name, last_name, onboarding_completed 
+        FROM users 
+        WHERE id = ${userId}
+      `;
+      console.log('✅ User data retrieved');
+    } catch (userError) {
+      console.error('❌ Error getting user data:', userError);
+      userResult = [];
+    }
+
+    // Parse study_challenges back to array for response
+    const profileData = result && result[0] ? { ...result[0] } : null;
+    if (profileData && profileData.study_challenges) {
+      try {
+        profileData.study_challenges = JSON.parse(profileData.study_challenges);
+      } catch (parseError) {
+        console.error('❌ Error parsing study challenges:', parseError);
+        profileData.study_challenges = studyChallenges;
+      }
+    }
+
+    // Return success response
+    res.status(200).json({
+      success: true,
+      profile: profileData || result,
+      user: userResult && userResult[0] ? userResult[0] : null,
+      message: 'Onboarding completed successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Error saving onboarding profile:', error);
+    console.error('❌ Error details:', error.message);
+    console.error('❌ Stack trace:', error.stack);
+
+    // Return a proper error response
+    res.status(500).json({
+      error: 'Failed to save onboarding profile. Please try again.',
+      details: error.message
+    });
+  }
+});
+
+// 8. Health check
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     emailProvider: 'Mailgun',
     verificationMethod: 'Code-based'
@@ -752,4 +1042,112 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📧 Using Mailgun for email delivery`);
   console.log(`🔐 Using code-based verification`);
   console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+})
+// 9. Test auth endpoint (protected route)
+app.get('/api/protected', auth, (req, res) => {
+  res.json({
+    message: 'This is a protected route',
+    user: req.user
+  });
 });
+
+// 10. Database status endpoint
+app.get('/api/db-status', async (req, res) => {
+  try {
+    // Check if tables exist
+    const tables = await sql`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
+      AND table_name IN ('users', 'user_profiles')
+    `;
+
+    const userCount = await sql`SELECT COUNT(*) FROM users`;
+    const profileCount = await sql`SELECT COUNT(*) FROM user_profiles`;
+
+    res.json({
+      status: 'Connected',
+      tables: tables.map(t => t.table_name),
+      userCount: parseInt(userCount[0].count),
+      profileCount: parseInt(profileCount[0].count),
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Database status error:', error);
+    res.status(500).json({
+      error: 'Failed to get database status'
+    });
+  }
+});
+
+// Add this endpoint to debug database issues
+app.get('/api/debug-user', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Check users table
+    const userResult = await sql`
+      SELECT * FROM users WHERE id = ${userId}
+    `;
+
+    // Check user_profiles table
+    const profileResult = await sql`
+      SELECT * FROM user_profiles WHERE user_id = ${userId}
+    `;
+
+    // Check if user_profiles table exists
+    const tableCheck = await sql`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'user_profiles'
+      )
+    `;
+
+    res.json({
+      user: userResult[0] || null,
+      profile: profileResult[0] || null,
+      tableExists: tableCheck[0].exists,
+      userId: userId
+    });
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({
+      error: error.message,
+      stack: error.stack
+    });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err);
+  res.status(500).json({
+    error: 'Something went wrong on the server'
+  });
+});
+
+// ==================== START SERVER ====================
+
+// Initialize database and start server
+const startServer = async () => {
+  try {
+    // Initialize database tables
+    await initializeDatabase();
+
+    // Start the server
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`\n🚀 Server running on port ${PORT}`);
+      console.log(`📧 Using Mailgun for email delivery`);
+      console.log(`🔐 Using code-based verification`);
+      console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+      console.log(`💾 Database status: http://localhost:${PORT}/api/db-status`);
+      console.log(`🔒 Protected route: http://localhost:${PORT}/api/protected (requires auth)\n`);
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+startServer();
