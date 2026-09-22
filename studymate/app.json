@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "StudyMateSDK55",
+    "slug": "StudyMateSDK55",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#208AEF"
+        }
+      ]
+    ]
+  }
+}
