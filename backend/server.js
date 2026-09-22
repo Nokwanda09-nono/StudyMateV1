@@ -695,15 +695,13 @@ const initializeDatabase = async () => {
 
     // Create triggers for each table
     for (const table of tablesWithUpdatedAt) {
-      await sql`
-        DROP TRIGGER IF EXISTS update_${table}_updated_at ON ${table}
-      `;
-      await sql`
-        CREATE TRIGGER update_${table}_updated_at 
-          BEFORE UPDATE ON ${table} 
-          FOR EACH ROW 
+      await sql.unsafe(`DROP TRIGGER IF EXISTS update_${table}_updated_at ON ${table}`);
+      await sql.unsafe(`
+        CREATE TRIGGER update_${table}_updated_at
+          BEFORE UPDATE ON ${table}
+          FOR EACH ROW
           EXECUTE FUNCTION update_updated_at_column()
-      `;
+      `);
       console.log(`✅ ${table} trigger ready`);
     }
 
@@ -900,6 +898,15 @@ const sendVerificationCodeEmail = async (email, firstName, code) => {
     console.log(`Verification code sent to ${email}`, data);
     return data;
   } catch (error) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn(`⚠️ Mail delivery failed in development mode for ${email}. Using local verification fallback. Code: ${code}`);
+      return {
+        devMode: true,
+        verificationCode: code,
+        message: 'Email delivery unavailable in development mode; verification code is provided for local testing.'
+      };
+    }
+
     console.error('Error sending verification code:', error);
     throw new Error('Failed to send verification code');
   }
@@ -971,21 +978,32 @@ app.post('/api/register', async (req, res) => {
     const newUser = result[0];
 
     // Send verification code email
+    let emailDelivery = { emailSent: true, verificationCode: null };
+
     try {
-      await sendVerificationCodeEmail(email, firstName, verificationCode);
+      const emailResult = await sendVerificationCodeEmail(email, firstName, verificationCode);
+      emailDelivery = {
+        emailSent: !(emailResult && emailResult.devMode),
+        verificationCode: emailResult && emailResult.devMode ? verificationCode : null,
+        devMode: !!(emailResult && emailResult.devMode)
+      };
     } catch (emailError) {
       console.error('Email sending failed:', emailError);
-      return res.status(201).json({
-        message: 'Registration successful but email sending failed. Please request a new code.',
-        user: newUser,
-        emailSent: false
-      });
+      emailDelivery = {
+        emailSent: false,
+        verificationCode: verificationCode,
+        devMode: process.env.NODE_ENV !== 'production'
+      };
     }
 
-    res.status(201).json({
-      message: 'Registration successful! Please check your email for the verification code.',
+    const message = emailDelivery.devMode
+      ? 'Registration successful. Use the verification code returned in the response for local testing.'
+      : 'Registration successful! Please check your email for the verification code.';
+
+    return res.status(201).json({
+      message,
       user: newUser,
-      emailSent: true,
+      ...emailDelivery
     });
 
   } catch (error) {
